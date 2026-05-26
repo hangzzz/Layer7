@@ -1,0 +1,17 @@
+# Test evidence — never commit; contains target hostnames, timestamps, response data
+evidence/
+*.log
+*.jsonl
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
