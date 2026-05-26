@@ -295,6 +295,12 @@ def main():
             "http-flood", "--path", args.path,
             "--rps", str(args.rps), "--workers", "20"]),
     ]
+    if args.tls:
+        # TLS-only attack — only run if target speaks TLS.
+        tests.append(("tls-handshake-flood", [
+            "tls-handshake-flood",
+            "--rps", str(args.rps), "--workers", "20",
+            "--no-resumption"]))
     if args.login_path:
         tests.append(("post-flood", [
             "post-flood", "--path", args.login_path,

