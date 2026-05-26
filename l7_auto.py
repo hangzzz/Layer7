@@ -168,10 +168,41 @@ def run_subtest(args, env, log_path, run_dir):
 
 def parse_jsonl_verdict(jsonl_path):
     # type: (Path) -> dict
-    """Walk a per-test JSONL and classify it as DEMONSTRATED / PARTIAL / NO IMPACT."""
+    """Walk a per-test JSONL and classify it.
+
+    Handles three formats:
+    1. Probe-event stream (slow-* / flood / tls-handshake-flood / tls-slow-handshake)
+    2. Single JSON object with top-level "verdict" key (tls-reneg-flood)
+    3. Single JSON object with "tests" key (tls-recon — report only)
+    """
     if not jsonl_path.exists():
         return {"verdict": "NO DATA", "probes": 0, "failed": 0, "ratio": 0.0,
                 "max_latency": 0.0, "notes": "no JSONL produced"}
+
+    # Try to parse the file as a single JSON document first.
+    try:
+        with open(str(jsonl_path)) as f:
+            blob = json.load(f)
+        if isinstance(blob, dict):
+            if "verdict" in blob:
+                return {"verdict": blob["verdict"], "probes": blob.get("attempts", 0),
+                        "failed": 0, "ratio": 0.0, "max_latency": 0.0,
+                        "notes": (blob.get("openssl_output_tail", "") or "")[-300:]}
+            if "tests" in blob:
+                # tls-recon report
+                dh = blob["tests"].get("default_handshake", {})
+                vs = blob["tests"].get("version_support", {})
+                accepted = [v for v, info in vs.items() if info.get("accepted")]
+                return {"verdict": "RECON", "probes": 1, "failed": 0, "ratio": 0.0,
+                        "max_latency": 0.0,
+                        "notes": "version={} cipher={} accepted_versions={}".format(
+                            dh.get("version"),
+                            (dh.get("cipher") or [None])[0],
+                            ",".join(accepted))}
+    except (ValueError, OSError):
+        pass
+
+    # Fall through to probe-event JSONL.
     probes = failed = 0
     latencies = []
     last_state = {}
@@ -181,6 +212,8 @@ def parse_jsonl_verdict(jsonl_path):
                 ev = json.loads(line)
             except ValueError:
                 continue
+            if not isinstance(ev, dict) or "probe_responded" not in ev:
+                continue
             probes += 1
             if not ev.get("probe_responded", False):
                 failed += 1
@@ -188,7 +221,7 @@ def parse_jsonl_verdict(jsonl_path):
             last_state = ev
     if probes == 0:
         return {"verdict": "NO DATA", "probes": 0, "failed": 0, "ratio": 0.0,
-                "max_latency": 0.0, "notes": "JSONL empty"}
+                "max_latency": 0.0, "notes": "JSONL empty or no probe events"}
     ratio = failed / float(probes)
     max_lat = max(latencies) if latencies else 0
     if ratio >= 0.5:
@@ -296,11 +329,21 @@ def main():
             "--rps", str(args.rps), "--workers", "20"]),
     ]
     if args.tls:
-        # TLS-only attack — only run if target speaks TLS.
+        # TLS-only attacks — only run if target speaks TLS.
+        # Recon first (quick, read-only) so the workpaper has the config picture.
+        tests.insert(0, ("tls-recon", ["tls-recon"]))
         tests.append(("tls-handshake-flood", [
             "tls-handshake-flood",
             "--rps", str(args.rps), "--workers", "20",
             "--no-resumption"]))
+        tests.append(("tls-slow-handshake", [
+            "tls-slow-handshake",
+            "--sockets", str(args.sockets),
+            "--drip-bytes", "1", "--drip-interval", "15"]))
+        # Reneg test is short and uses openssl; skip if openssl missing.
+        tests.append(("tls-reneg-flood", [
+            "tls-reneg-flood",
+            "--attempts", "10", "--interval", "1"]))
     if args.login_path:
         tests.append(("post-flood", [
             "post-flood", "--path", args.login_path,

