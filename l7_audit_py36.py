@@ -77,30 +77,40 @@ def setup_evidence(host, technique, evidence_dir):
     return logging.getLogger(technique), jsonl_path, log_path, run_id
 
 
-def probe(host, port, use_tls, path="/"):
-    # type: (str, int, bool, str) -> Tuple[bool, float]
+def _make_ctx(insecure):
+    # type: (bool) -> ssl.SSLContext
+    ctx = ssl.create_default_context()
+    if insecure:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def probe(host, port, use_tls, path="/", insecure=False):
+    # type: (str, int, bool, str, bool) -> Tuple[bool, float]
     start = time.monotonic()
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(10)
         s.connect((host, port))
         if use_tls:
-            ctx = ssl.create_default_context()
-            s = ctx.wrap_socket(s, server_hostname=host)
+            s = _make_ctx(insecure).wrap_socket(s, server_hostname=host)
         req = "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n".format(path, host)
         s.send(req.encode())
         data = s.recv(64)
         s.close()
         return (bool(data), time.monotonic() - start)
-    except OSError:
+    except OSError as e:
+        logging.debug("probe failed: %s", e)
         return (False, time.monotonic() - start)
 
 
 class ProbeThread(threading.Thread):
     """Background probe at fixed interval, writes JSONL evidence."""
 
-    def __init__(self, host, port, tls, interval, jsonl_path, get_state, stop_event):
-        # type: (str, int, bool, int, Path, Callable[[], Dict], threading.Event) -> None
+    def __init__(self, host, port, tls, interval, jsonl_path, get_state, stop_event,
+                 insecure=False):
+        # type: (str, int, bool, int, Path, Callable[[], Dict], threading.Event, bool) -> None
         super().__init__()
         self.daemon = True
         self.host, self.port, self.tls = host, port, tls
@@ -108,12 +118,13 @@ class ProbeThread(threading.Thread):
         self.jsonl_path = jsonl_path
         self.get_state = get_state
         self.stop_event = stop_event
+        self.insecure = insecure
         self.start_time = time.monotonic()
 
     def run(self):
         with open(str(self.jsonl_path), "w") as f:
             while not self.stop_event.is_set():
-                ok, latency = probe(self.host, self.port, self.tls)
+                ok, latency = probe(self.host, self.port, self.tls, insecure=self.insecure)
                 event = {
                     "ts": dt.datetime.now().isoformat(),
                     "elapsed_s": round(time.monotonic() - self.start_time, 2),
@@ -130,17 +141,28 @@ class ProbeThread(threading.Thread):
                     break
 
 
-def open_raw_socket(host, port, use_tls, timeout=4):
-    # type: (str, int, bool, float) -> Optional[socket.socket]
+_CONNECT_ERR_SEEN = {"count": 0, "last": None}
+
+
+def open_raw_socket(host, port, use_tls, timeout=4, insecure_tls=False):
+    # type: (str, int, bool, float, bool) -> Optional[socket.socket]
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
         s.connect((host, port))
         if use_tls:
-            ctx = ssl.create_default_context()
-            s = ctx.wrap_socket(s, server_hostname=host)
+            s = _make_ctx(insecure_tls).wrap_socket(s, server_hostname=host)
         return s
-    except OSError:
+    except OSError as e:
+        # Log first occurrence and every 50th after that, so you SEE failures
+        # but don't drown the log when the target is genuinely down.
+        msg = "{}: {}".format(type(e).__name__, e)
+        _CONNECT_ERR_SEEN["count"] += 1
+        if _CONNECT_ERR_SEEN["count"] == 1 or msg != _CONNECT_ERR_SEEN["last"] \
+                or _CONNECT_ERR_SEEN["count"] % 50 == 0:
+            logging.warning("connect failed %s:%s tls=%s [%d so far] %s",
+                            host, port, use_tls, _CONNECT_ERR_SEEN["count"], msg)
+            _CONNECT_ERR_SEEN["last"] = msg
         return None
 
 
@@ -156,7 +178,7 @@ def cmd_slow_headers(a):
     sockets = []  # type: List[socket.socket]
 
     def open_one():
-        s = open_raw_socket(a.host, a.port, a.tls)
+        s = open_raw_socket(a.host, a.port, a.tls, insecure_tls=a.insecure)
         if not s:
             return None
         try:
@@ -175,7 +197,8 @@ def cmd_slow_headers(a):
     log.info("initial sockets held=%d/%d", len(sockets), a.sockets)
 
     probe_t = ProbeThread(a.host, a.port, a.tls, a.probe_interval, jsonl,
-                          lambda: {"held_sockets": len(sockets)}, stop)
+                          lambda: {"held_sockets": len(sockets)}, stop,
+                          insecure=a.insecure)
     probe_t.start()
     start = time.monotonic()
 
@@ -220,7 +243,7 @@ def cmd_slow_body(a):
     sockets = []  # type: List[socket.socket]
 
     def open_one():
-        s = open_raw_socket(a.host, a.port, a.tls)
+        s = open_raw_socket(a.host, a.port, a.tls, insecure_tls=a.insecure)
         if not s:
             return None
         try:
@@ -241,7 +264,8 @@ def cmd_slow_body(a):
     log.info("initial sockets held=%d/%d path=%s", len(sockets), a.sockets, a.path)
 
     probe_t = ProbeThread(a.host, a.port, a.tls, a.probe_interval, jsonl,
-                          lambda: {"held_sockets": len(sockets)}, stop)
+                          lambda: {"held_sockets": len(sockets)}, stop,
+                          insecure=a.insecure)
     probe_t.start()
     start = time.monotonic()
 
@@ -292,8 +316,7 @@ def cmd_slow_read(a):
             s.settimeout(4)
             s.connect((a.host, a.port))
             if a.tls:
-                ctx = ssl.create_default_context()
-                s = ctx.wrap_socket(s, server_hostname=a.host)
+                s = _make_ctx(a.insecure).wrap_socket(s, server_hostname=a.host)
             req = (
                 "GET {} HTTP/1.1\r\n"
                 "Host: {}\r\n"
@@ -313,7 +336,8 @@ def cmd_slow_read(a):
     log.info("initial sockets held=%d/%d recv_buf=%d", len(sockets), a.sockets, a.recv_buf)
 
     probe_t = ProbeThread(a.host, a.port, a.tls, a.probe_interval, jsonl,
-                          lambda: {"held_sockets": len(sockets)}, stop)
+                          lambda: {"held_sockets": len(sockets)}, stop,
+                          insecure=a.insecure)
     probe_t.start()
     start = time.monotonic()
 
@@ -360,8 +384,11 @@ def cmd_slow_read(a):
 # ----------------------------------------------------------------------------
 
 
+_FLOOD_ERR_SEEN = {"count": 0, "last": None}
+
+
 def _flood_worker(host, port, tls, method, path_fn, body_fn, headers,
-                  stop_event, counters, rate_limiter):
+                  stop_event, counters, rate_limiter, insecure=False):
     while not stop_event.is_set():
         rate_limiter.wait()
         path = path_fn()
@@ -370,7 +397,7 @@ def _flood_worker(host, port, tls, method, path_fn, body_fn, headers,
         try:
             if tls:
                 conn = http.client.HTTPSConnection(host, port, timeout=10,
-                                                   context=ssl.create_default_context())
+                                                   context=_make_ctx(insecure))
             else:
                 conn = http.client.HTTPConnection(host, port, timeout=10)
             conn.request(method, path, body=body, headers=headers)
@@ -381,10 +408,15 @@ def _flood_worker(host, port, tls, method, path_fn, body_fn, headers,
             counters[key] = counters.get(key, 0) + 1
             counters["latency_sum"] += time.monotonic() - start
             conn.close()
-        except OSError:
+        except (OSError, http.client.HTTPException) as e:
             counters["errors"] += 1
-        except http.client.HTTPException:
-            counters["errors"] += 1
+            msg = "{}: {}".format(type(e).__name__, e)
+            _FLOOD_ERR_SEEN["count"] += 1
+            if _FLOOD_ERR_SEEN["count"] == 1 or msg != _FLOOD_ERR_SEEN["last"] \
+                    or _FLOOD_ERR_SEEN["count"] % 100 == 0:
+                logging.warning("request failed [%d so far] %s",
+                                _FLOOD_ERR_SEEN["count"], msg)
+                _FLOOD_ERR_SEEN["last"] = msg
 
 
 class TokenBucket(object):
@@ -424,7 +456,8 @@ def _run_flood(a, technique, method, path_fn, body_fn, extra_headers=None):
     for _ in range(a.workers):
         t = threading.Thread(target=_flood_worker,
                              args=(a.host, a.port, a.tls, method, path_fn, body_fn,
-                                   headers, stop, counters, bucket))
+                                   headers, stop, counters, bucket),
+                             kwargs={"insecure": a.insecure})
         t.daemon = True
         t.start()
         workers.append(t)
@@ -434,7 +467,8 @@ def _run_flood(a, technique, method, path_fn, body_fn, extra_headers=None):
         return {"requests": counters["requests"], "errors": counters["errors"],
                 "avg_latency_s": round(counters["latency_sum"] / n, 3)}
 
-    probe_t = ProbeThread(a.host, a.port, a.tls, a.probe_interval, jsonl, state, stop)
+    probe_t = ProbeThread(a.host, a.port, a.tls, a.probe_interval, jsonl, state, stop,
+                          insecure=a.insecure)
     probe_t.start()
 
     log.info("flood started rps=%s workers=%s duration=%ds",
@@ -494,7 +528,7 @@ def cmd_payload(a):
             req = urllib.request.Request(url, data=body, method=a.method,
                                          headers={"Content-Type": a.content_type,
                                                   "User-Agent": random.choice(USER_AGENTS)})
-            ctx = ssl.create_default_context() if a.tls else None
+            ctx = _make_ctx(a.insecure) if a.tls else None
             resp = urllib.request.urlopen(req, timeout=a.timeout, context=ctx)
             try:
                 _ = resp.read(256)
@@ -530,6 +564,8 @@ def build_parser():
         sp.add_argument("--host", required=True)
         sp.add_argument("--port", type=int, default=443)
         sp.add_argument("--tls", action="store_true")
+        sp.add_argument("--insecure", action="store_true",
+                        help="Skip TLS cert verification (non-prod / self-signed)")
         sp.add_argument("--duration", type=int, default=180)
         sp.add_argument("--probe-interval", type=int, default=5)
         sp.add_argument("--evidence-dir", default="./evidence")
